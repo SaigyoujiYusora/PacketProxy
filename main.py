@@ -1,29 +1,26 @@
 import asyncio
+import json
 import logging as org_logging
 import random
 from contextlib import asynccontextmanager
-from typing import Dict
+from random import randint
+from typing import Dict, List, final
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
+from websockets.sync.client import connect
 
 # 配置uvicorn日志
 logging = org_logging.getLogger("uvicorn")
 logging.setLevel(org_logging.DEBUG)
-# 客户端
-clients: Dict[str, WebSocket] = {}
-# 事件队列
-event_queue = asyncio.Queue()
-# 用于存储所有 WebSocket 连接的列表
-connections = []
+
 # 客户端名称
 client_alias_list = [
     "水星",
+    "火星",
     "木卫二中转节点",
     "联邦第三行星级计算节点"
 ]
-# 心跳包进程
-heartbeat_tasks: Dict[int, asyncio.Task] = {}
 
 
 # 傻逼吧 运行完了才跑后半截
@@ -36,21 +33,129 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
-async def heartbeat():
-    while True:
-        await asyncio.sleep(5)
-        for client in clients.values():
-            try:
-                await client.send_json({"type": "heartbeat"})
-            except Exception as e:
-                logging.error(f"心跳包发送失败: {e}")
-                continue
-
-
 """
 时尚小垃圾分界点
 """
+
+
+class QueueManager:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.cache = []
+
+    async def put(self, data):
+        """
+        将数据放入消息队列和缓存
+        :param data: 要存的数据
+        """
+        await self.queue.put(data)
+        self.cache.append(data)
+
+    async def get(self):
+        """
+        从消息队列中取出数据
+        理论上和asyncio.Queue.get()一样在无数据时挂起当前协程
+        :return:
+        """
+        data = await self.queue.get()
+        if data in self.cache:
+            self.cache.remove(data)
+        return data
+
+    def empty(self):
+        """
+        判断消息队列是否为空
+        :return:
+        """
+        return self.queue.empty()
+
+    def peak(self):
+        """
+        偷看队列缓存的第一个元素
+        :return:
+        """
+        return self.cache[-1]
+
+
+class WebSocketManager:
+    def __init__(self):
+        """
+        clients: 客户端名称和索引的映射
+        connections: 所有连接的客户端
+        event_queue: 事件队列
+        """
+        self.clients = {}
+        self.connections: List[WebSocket] = []
+        # self.event_queue = asyncio.Queue()
+        self.event_queue = QueueManager()
+        """
+        格式: {"sessionID": client_index(Int)}
+        示例: {"114514191": 1, "19198100": 0}
+        """
+        self.session_bind = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+
+        # 客户端认证
+        await websocket.send_text('f{"code":}')
+
+        # 客户端名称
+        self.connections.append(websocket)
+        client_id = self.connections.index(websocket)
+        self.clients[client_alias_list[client_id]] = client_id
+
+    def disconnect(self, websocket: WebSocket,data=None):
+        # 获取客户端索引
+        client_id = self.connections.index(websocket)
+        # 从connections中移除客户端
+        self.connections.remove(websocket)
+        # 从clients中移除客户端
+        del self.clients[client_alias_list[client_id]]
+
+        # 将客户端的sessionID交给session_bind中的其他客户端
+        new_client_id = randint(0, len(self.connections))
+        for session, index in self.session_bind.items():
+            if index == client_id:
+                self.session_bind[session] = new_client_id
+
+
+    async def send_data(self, data_packet: Dict, client_id: str = None):
+        if client_id:
+            await self.clients[client_id].send_json(data_packet)
+
+    async def broadcast(self, message: str):
+        for client in self.connections:
+            await client.send_text(message)
+
+    async def client_bind_session(self, session_id: str, client_id: int):
+        self.session_bind[session_id] = client_id
+
+    def get_index(self, websocket: WebSocket):
+        """
+        获取websocket在connections中的索引
+        :param websocket:
+        :return:
+        """
+        try:
+            index = self.connections.index(websocket)
+        except ValueError:
+            index = None
+        return index
+
+    async def heartbeat(self, websocket: WebSocket, interval: int = 20):
+        while True:
+            try:
+                logging.info("发送心跳包")
+                await websocket.send_text("ping")
+                await asyncio.sleep(interval)
+            except WebSocketDisconnect:
+                logging.info("心跳包检测到客户端断开连接")
+                self.disconnect(websocket)
+                break
+
+
+ws_manger = WebSocketManager()
 
 
 @app.get("/get_server_url/")
@@ -61,138 +166,80 @@ def get_server_url():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    connections.append(websocket)
-    client_id = str(websocket.client)
-    clients[client_id] = websocket
+    await ws_manger.connect(websocket)
+
+    heartbeat_task = asyncio.create_task(ws_manger.heartbeat(websocket))
     try:
         while True:
-            # 等待事件队列或心跳包超时
-            data_task = asyncio.create_task(event_queue.get())
-            heartbeat_task = asyncio.create_task(asyncio.sleep(10))  # 心跳包间隔时间
+            try:
+                if websocket not in ws_manger.connections:
+                    logging.info(f"终止{websocket}监听进程")
+                    break
+                cache = ws_manger.event_queue.peak()
 
-            done, pending = await asyncio.wait(
-                [data_task, heartbeat_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            logging.info(f"完成队列: {done}")
-
-            if data_task in done:
-                logging.debug(f"触发转发事件")
-                # 如果接收到数据包
-                data_packet = data_task.result()
-                if not data_packet:
+                # 如果当前客户端的sessionID不在session_bind中, 则跳过
+                if ws_manger.session_bind.get(cache.get("session")) is None:
+                    # 分配随机客户端给sessionID
+                    logging.info("未找到对应节点，分配客户端中")
+                    await ws_manger.client_bind_session(cache.get("session"), randint(0, len(ws_manger.connections)))
+                elif ws_manger.connections.index(websocket) != ws_manger.session_bind.get(cache.get("session")):
+                    await asyncio.sleep(1)
+                    logging.info("SessionID不匹配")
                     continue
-
-                logging.info("获取连接")
-                connection = random.choice(connections)
-                logging.debug(connection)
-                logging.info("开始转发数据包")
-
-                try:
-                    await connection.send_json(data_packet)
-                except Exception as e:
-                    logging.warning(f"数据下发失败: {e}")
-                    logging.warning(connection)
-
-                logging.info(data_packet)
-
-            if heartbeat_task in done:
-                logging.debug(f"触发心跳包")
-                # 发送心跳包
-                try:
-                    await websocket.send_text("ping")
-                    pong = await asyncio.wait_for(websocket.receive_text(), timeout=10)  # 等待客户端的 "pong"
-                    logging.info(f"完成队列: {done}")
-                    # if pong != "pong":
-                    #     raise WebSocketDisconnect
-                except asyncio.TimeoutError:
-                    logging.warning("心跳包超时，客户端可能已断开连接")
-                    raise WebSocketDisconnect
-
-            # 取消未完成的任务
-            for task in pending:
-                task.cancel()
-            # # 从事件队列中获取下一个数据包
-            # try:
-            #     data_packet = await event_queue.get()
-            # except asyncio.CancelledError:
-            #     connections.remove(websocket)
-            #     del clients[client_id]
-            #     logging.warning("ws监听事件已关闭")
-            #     break
-            # except WebSocketDisconnect:
-            #     connections.remove(websocket)
-            #     del clients[client_id]
-            #     logging.info("客户端断开连接")
-            # logging.info(f"wow")
-            # # try:
-            # #     data_packet = await asyncio.wait_for(event_queue.get(), timeout=5)
-            # # except asyncio.TimeoutError:
-            # #     print("等待数据超时")
-            # #     print("关闭事件状态", shutdown_event.is_set())
-            # #     if shutdown_event.is_set():
-            # #         print("关闭事件已触发")
-            # #         break
-            # #     continue
-            # # except asyncio.CancelledError:
-            # #     print("事件队列已关闭2")
-            # #     break
-            # # 随机获取一个连接
-            # if not data_packet:
-            #     continue
-            # print("获取连接")
-            # connection = random.choice(connections)
-            # print("开始转发数据包")
-            # try:
-            #     await connection.send_json(data_packet)
-            #     # await websocket.send_json(data_packet)
-            # except Exception as e:
-            #     print(f"数据下发失败: {e}")
-            # print(data_packet)
+            except IndexError:
+                await asyncio.sleep(1)
+                logging.debug("在循环里2")
+                continue
+            except KeyError as e:
+                if e.args[0] is not None:
+                    logging.error(f"发生KeyError错误: {e}")
+                await websocket.send_text("ping")
+            logging.debug("等待数据包")
+            data = await ws_manger.event_queue.get()
+            logging.debug("发送数据包")
+            await websocket.send_json(data)
     except WebSocketDisconnect:
-        connections.remove(websocket)
-        del clients[client_id]
-        logging.info("客户端断开连接")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        logging.error(f"An error occurred: {e}")
+        ws_manger.disconnect(websocket)
+        logging.info("发送失败-->客户端断开连接")
     finally:
-        if websocket in connections:
-            connections.remove(websocket)
-        if client_id in clients:
-            del clients[client_id]
-        try:
-            await websocket.close()  # 确保 WebSocket 连接关闭
-        except RuntimeError:
-            pass
-        logging.info(f"WebSocket 连接已关闭，客户端 {client_id} 已断开连接")
+        heartbeat_task.cancel()
 
 
 @app.post("/send_data")
 async def send_data(data_packet: Dict):
     # 接收到数据包后将其放入事件队列
-    await event_queue.put(data_packet)
+    check_list = ["header", "addr", "data", "session"]
+    missing = []
+    for item in check_list:
+        if data_packet.get(item) is None:
+            missing.append(item)
+    else:
+        if len(missing) > 0:
+            return JSONResponse({"status": "数据包缺少以下字段: " + ", ".join(missing)})
+
+    if data_packet.get("session") is None:
+        data_packet["session"] = -1
+    await ws_manger.event_queue.put(data_packet)
     return JSONResponse({"status": "数据包进入队列"})
 
 
-@app.post("/send_data_one_client")
-async def sent_data_one(data_packet: Dict):
-    # 接收到数据包后将其放入事件队列, 加入参数指定的客户端
-    client_id = data_packet.get("client_id")
-    if client_id in clients:
-        await clients[client_id].send_json(data_packet)
-        return JSONResponse({"status": "数据包已发送"})
+# @app.post("/send_data_one_client")
+# async def sent_data_one(data_packet: Dict):
+#     # 接收到数据包后将其放入事件队列, 加入参数指定的客户端
+#     client_id = data_packet.get("client_id")
+#     if client_id in clients:
+#         await clients[client_id].send_json(data_packet)
+#         return JSONResponse({"status": "数据包已发送"})
 
 
 @app.get("/query_data")
 async def query_data():
     # 打印整个事件队列
-    data = []
-    while not event_queue.empty():
-        data.append(await event_queue.get())
-    return JSONResponse({"data": data})
+    data = {"latest_data": None, "queue": []}
+    if not ws_manger.event_queue.empty():
+        data["latest_data"] = ws_manger.event_queue.peak()
+        data["queue"] = ws_manger.event_queue.cache
+    return JSONResponse(data)
 
 
 @app.post("/ws_test")
@@ -206,8 +253,8 @@ async def ws_test(request: Request):
 
 @app.get("/get_online_clients")
 async def online_client():
-    print(clients.keys())
-    print(clients)
-    print(connections)
+    print(ws_manger.clients.keys())
+    print(ws_manger.clients)
+    print(ws_manger.connections)
     # 返回在线客户端的数量
-    # return JSONResponse({"online_clients": clients.keys()})
+    return JSONResponse({"online_clients": ws_manger.clients})
