@@ -80,68 +80,92 @@ class QueueManager:
 class WebSocketManager:
     def __init__(self):
         """
-        clients: 客户端名称和索引的映射
-        connections: 所有连接的客户端
-        event_queue: 事件队列
+        自己搓的WS管理器
         """
-        self.clients = {}
-        self.connections: List[WebSocket] = []
+        self.clients: Dict[str, int] = {}  # {"客户端名称": 客户端索引}
+        # self.connections: List[WebSocket] = []
+        self.connections: Dict[int, WebSocket] = {}  # {客户端索引: WebSocket}
         # self.event_queue = asyncio.Queue()
-        self.event_queue = QueueManager()
+        self.event_queue = QueueManager()  # 事件队列
         """
         格式: {"sessionID": client_index(Int)}
         示例: {"114514191": 1, "19198100": 0}
         """
-        self.session_bind = {}
+        self.session_bind: Dict[str | int, int] = {}
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
 
         # 客户端认证
-        await websocket.send_text('f{"code":}')
+        # await websocket.send_text('f{"code":}')
 
-        # 客户端名称
-        self.connections.append(websocket)
-        client_id = self.connections.index(websocket)
-        self.clients[client_alias_list[client_id]] = client_id
+        # 客户端连接
+        try:
+            client_id = [*self.connections.keys()][-1] + 1
+        except IndexError:
+            client_id = 0
+        self.connections[client_id] = websocket
 
-    def disconnect(self, websocket: WebSocket,data=None):
+        # 分配客户端标识名称
+        diff = set(client_alias_list).difference(set(self.clients))
+        if diff:
+            client_name = list(diff)[0]
+        else:
+            client_name = f"客户端{client_id}"
+        self.clients[client_name] = client_id
+
+    def disconnect(self, websocket: WebSocket, data=None):
         # 获取客户端索引
-        client_id = self.connections.index(websocket)
+        client_id = self.get_id(websocket)
         # 从connections中移除客户端
-        self.connections.remove(websocket)
+        del self.connections[client_id]
         # 从clients中移除客户端
-        del self.clients[client_alias_list[client_id]]
+        del self.clients[self.get_name(websocket)]
 
-        # 将客户端的sessionID交给session_bind中的其他客户端
-        new_client_id = randint(0, len(self.connections))
+        # 将客户端的sessionID交给其他客户端, 优先空闲客户端
+        idle_clients = list(self.connections.keys())
+        for index in self.session_bind.values():
+            if index in idle_clients:
+                idle_clients.remove(index)
+        new_client_id = random.choice(idle_clients)
         for session, index in self.session_bind.items():
             if index == client_id:
                 self.session_bind[session] = new_client_id
 
-
-    async def send_data(self, data_packet: Dict, client_id: str = None):
-        if client_id:
-            await self.clients[client_id].send_json(data_packet)
+    async def send_data(self, data_packet: Dict, client_name: str = None):
+        if client_name:
+            await self.connections[self.clients[client_name]].send_json(data_packet)
 
     async def broadcast(self, message: str):
-        for client in self.connections:
+        for client in self.connections.values():
             await client.send_text(message)
 
     async def client_bind_session(self, session_id: str, client_id: int):
         self.session_bind[session_id] = client_id
 
-    def get_index(self, websocket: WebSocket):
+    def get_id(self, websocket: WebSocket):
         """
         获取websocket在connections中的索引
         :param websocket:
         :return:
         """
         try:
-            index = self.connections.index(websocket)
+            index = list(self.connections.keys())[list(self.connections.values()).index(websocket)]
         except ValueError:
             index = None
         return index
+
+    def get_name(self, websocket: WebSocket):
+        """
+        获取websocket在clients中的名称
+        :param websocket:
+        :return:
+        """
+        try:
+            name = list(self.clients.keys())[list(self.clients.values()).index(self.get_id(websocket))]
+        except ValueError:
+            name = None
+        return name
 
     async def heartbeat(self, websocket: WebSocket, interval: int = 20):
         while True:
@@ -160,6 +184,10 @@ ws_manger = WebSocketManager()
 
 @app.get("/get_server_url/")
 def get_server_url():
+    """
+    获取主服务器的URL
+    :return:
+    """
     # 返回主服务器的URL
     return JSONResponse({"server_url": "ws://localhost:8000/ws"})
 
@@ -182,7 +210,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # 分配随机客户端给sessionID
                     logging.info("未找到对应节点，分配客户端中")
                     await ws_manger.client_bind_session(cache.get("session"), randint(0, len(ws_manger.connections)))
-                elif ws_manger.connections.index(websocket) != ws_manger.session_bind.get(cache.get("session")):
+                elif ws_manger.get_id(websocket) != ws_manger.session_bind.get(cache.get("session")):
                     await asyncio.sleep(1)
                     logging.info("SessionID不匹配")
                     continue
