@@ -8,6 +8,7 @@ from typing import Dict, List, final
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
+from watchfiles import awatch
 from websockets.sync.client import connect
 
 # 配置uvicorn日志
@@ -114,27 +115,41 @@ class WebSocketManager:
             client_name = f"客户端{client_id}"
         self.clients[client_name] = client_id
 
-    def disconnect(self, websocket: WebSocket, data=None):
+    async def disconnect(self, websocket: WebSocket,data = None):
         # 获取客户端索引
         client_id = self.get_id(websocket)
+        client_name = self.get_name(websocket)
         # 从connections中移除客户端
         del self.connections[client_id]
         # 从clients中移除客户端
-        del self.clients[self.get_name(websocket)]
+        del self.clients[client_name]
 
-        # 将客户端的sessionID交给其他客户端, 优先空闲客户端
-        idle_clients = list(self.connections.keys())
+
+        # 尝试从空闲客户端列表获取一个客户端
+        idle_client_ids = list(self.connections.keys())
         for index in self.session_bind.values():
-            if index in idle_clients:
-                idle_clients.remove(index)
-        new_client_id = random.choice(idle_clients)
+            if index in idle_client_ids:
+                idle_client_ids.remove(index)
+        if idle_client_ids:
+            new_client_id = random.choice(idle_client_ids)
+        else:
+            new_client_id = random.choice(list(self.connections.keys()))
+
+        # 将发送失败的数据转交给新的客户端
+        if data:
+            logging.warning("移交发送失败的数据包给新的客户端")
+            await self.send_data(data, client_id=new_client_id)
+        # 将客户端的sessionID交给新的客户端
         for session, index in self.session_bind.items():
             if index == client_id:
                 self.session_bind[session] = new_client_id
 
-    async def send_data(self, data_packet: Dict, client_name: str = None):
+
+    async def send_data(self, data_packet: Dict, client_name: str = None, client_id: int = None):
         if client_name:
             await self.connections[self.clients[client_name]].send_json(data_packet)
+        if client_id:
+            await self.connections[client_id].send_json(data_packet)
 
     async def broadcast(self, message: str):
         for client in self.connections.values():
@@ -147,7 +162,7 @@ class WebSocketManager:
         """
         获取websocket在connections中的索引
         :param websocket:
-        :return:
+        :return: 客户端id
         """
         try:
             index = list(self.connections.keys())[list(self.connections.values()).index(websocket)]
@@ -159,7 +174,7 @@ class WebSocketManager:
         """
         获取websocket在clients中的名称
         :param websocket:
-        :return:
+        :return: 客户端名称
         """
         try:
             name = list(self.clients.keys())[list(self.clients.values()).index(self.get_id(websocket))]
@@ -175,8 +190,16 @@ class WebSocketManager:
                 await asyncio.sleep(interval)
             except WebSocketDisconnect:
                 logging.info("心跳包检测到客户端断开连接")
-                self.disconnect(websocket)
+                await self.disconnect(websocket)
                 break
+
+    def random_choice_id(self):
+        """
+        随机选择一个客户端
+        :return: 客户端id
+        """
+        client_id = random.choice(list(self.connections.keys()))
+        return client_id
 
 
 ws_manger = WebSocketManager()
@@ -197,40 +220,40 @@ async def websocket_endpoint(websocket: WebSocket):
     await ws_manger.connect(websocket)
 
     heartbeat_task = asyncio.create_task(ws_manger.heartbeat(websocket))
-    try:
-        while True:
-            try:
-                if websocket not in ws_manger.connections:
-                    logging.info(f"终止{websocket}监听进程")
-                    break
-                cache = ws_manger.event_queue.peak()
+    while True:
+        try:
+            if websocket not in list(ws_manger.connections.values()):
+                logging.info(f"终止{websocket}监听进程")
+                break
+            cache = ws_manger.event_queue.peak()
 
-                # 如果当前客户端的sessionID不在session_bind中, 则跳过
-                if ws_manger.session_bind.get(cache.get("session")) is None:
-                    # 分配随机客户端给sessionID
-                    logging.info("未找到对应节点，分配客户端中")
-                    await ws_manger.client_bind_session(cache.get("session"), randint(0, len(ws_manger.connections)))
-                elif ws_manger.get_id(websocket) != ws_manger.session_bind.get(cache.get("session")):
-                    await asyncio.sleep(1)
-                    logging.info("SessionID不匹配")
-                    continue
-            except IndexError:
-                await asyncio.sleep(1)
-                logging.debug("在循环里2")
+            # 如果当前客户端的sessionID不在session_bind中, 则跳过
+            if ws_manger.session_bind.get(cache.get("session")) is None:
+                # 分配随机客户端给sessionID
+                logging.info("未找到对应节点，分配客户端中")
+                await ws_manger.client_bind_session(cache.get("session"), ws_manger.random_choice_id())
                 continue
-            except KeyError as e:
-                if e.args[0] is not None:
-                    logging.error(f"发生KeyError错误: {e}")
-                await websocket.send_text("ping")
-            logging.debug("等待数据包")
-            data = await ws_manger.event_queue.get()
-            logging.debug("发送数据包")
+            # 如果当前客户端的sessionID和session_bind中的sessionID不匹配, 则跳过
+            elif ws_manger.get_id(websocket) != ws_manger.session_bind.get(cache.get("session")):
+                await asyncio.sleep(1)
+                logging.info("SessionID不匹配")
+                continue
+        # 未找到数据包
+        except IndexError:
+            await asyncio.sleep(1)
+            # logging.debug("在循环里2")
+            continue
+        logging.debug("等待数据包")
+        data = await ws_manger.event_queue.get()
+        logging.debug("发送数据包")
+        try:
             await websocket.send_json(data)
-    except WebSocketDisconnect:
-        ws_manger.disconnect(websocket)
-        logging.info("发送失败-->客户端断开连接")
-    finally:
-        heartbeat_task.cancel()
+        except WebSocketDisconnect:
+            await ws_manger.disconnect(websocket,data)
+            logging.info("发送失败-->客户端断开连接")
+        finally:
+            heartbeat_task.cancel()
+
 
 
 @app.post("/send_data")
@@ -246,7 +269,7 @@ async def send_data(data_packet: Dict):
             return JSONResponse({"status": "数据包缺少以下字段: " + ", ".join(missing)})
 
     if data_packet.get("session") is None:
-        data_packet["session"] = -1
+        data_packet["session"] = None
     await ws_manger.event_queue.put(data_packet)
     return JSONResponse({"status": "数据包进入队列"})
 
